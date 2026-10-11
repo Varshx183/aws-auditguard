@@ -1,0 +1,518 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "AuditGuard optional world-open SSH detection; requires an active regional CloudTrail trail.",
+  "Parameters": {
+    "AlertTopicArn": {
+      "Type": "String",
+      "Description": "Existing same-account, same-Region SNS topic ARN with a confirmed subscription."
+    },
+    "RuntimeRoleArn": {
+      "Type": "String",
+      "Default": "",
+      "Description": "Optional pre-provisioned Lambda role for OIDC deployments."
+    },
+    "EnableFailureSimulation": {
+      "Type": "String",
+      "Default": "false",
+      "AllowedValues": [
+        "true",
+        "false"
+      ],
+      "Description": "Enable only for the synthetic asynchronous failure exercise."
+    }
+  },
+  "Resources": {
+    "DetectorLogs": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${AWS::StackName}-detector"
+        },
+        "RetentionInDays": 7
+      }
+    },
+    "DetectorRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "DetectAndNotify",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "DetectorLogs",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "sns:Publish",
+                  "Resource": {
+                    "Ref": "AlertTopicArn"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "sqs:SendMessage",
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "ProcessingFailures",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "ec2:DescribeSecurityGroupRules",
+                  "Resource": "*",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestedRegion": {
+                        "Ref": "AWS::Region"
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "Condition": "CreateRuntimeRole"
+    },
+    "Detector": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "FunctionName": {
+          "Fn::Sub": "${AWS::StackName}-detector"
+        },
+        "Runtime": "python3.12",
+        "Handler": "index.handler",
+        "Role": {
+          "Fn::If": [
+            "CreateRuntimeRole",
+            {
+              "Fn::GetAtt": [
+                "DetectorRole",
+                "Arn"
+              ]
+            },
+            {
+              "Ref": "RuntimeRoleArn"
+            }
+          ]
+        },
+        "Timeout": 15,
+        "MemorySize": 128,
+        "Environment": {
+          "Variables": {
+            "ALERT_TOPIC_ARN": {
+              "Ref": "AlertTopicArn"
+            },
+            "ENABLE_FAILURE_SIMULATION": {
+              "Ref": "EnableFailureSimulation"
+            }
+          }
+        },
+        "Code": {
+          "ZipFile": "\"\"\"Detect world-open SSH in CloudTrail ingress authorization requests.\n\nModification events use a read-only lookup to confirm rule direction and current state.\nNo EC2 mutation is performed. Each permission is evaluated separately\nso unrelated ports and CIDRs cannot be combined into a false positive.\n\"\"\"\nimport ipaddress\nimport json\nimport os\n\n\ndef items(value):\n    if isinstance(value, dict):\n        value = value.get('items', [])\n    return [v for v in value if isinstance(v, dict)] if isinstance(value, list) else []\n\n\ndef world_cidr(value):\n    try:\n        return ipaddress.ip_network(value, strict=False).prefixlen == 0\n    except (ValueError, TypeError):\n        return False\n\n\ndef allows_ssh(permission):\n    protocol = str(permission.get('ipProtocol', '')).lower()\n    if protocol == '-1':\n        return True\n    if protocol not in ('tcp', '6'):\n        return False\n    try:\n        low, high = int(permission['fromPort']), int(permission['toPort'])\n        return 0 <= low <= 22 <= high <= 65535\n    except (KeyError, TypeError, ValueError):\n        return False\n\n\ndef modification_request(detail):\n    request = detail.get('requestParameters') or {}\n    if not isinstance(request, dict):\n        raise ValueError('Unsupported modification request shape')\n    request = request.get('ModifySecurityGroupRulesRequest', request)\n    if not isinstance(request, dict):\n        raise ValueError('Unsupported modification request shape')\n    group = request.get('GroupId', request.get('groupId'))\n    rules = request.get('SecurityGroupRule', request.get('securityGroupRuleSet',\n                        request.get('securityGroupRules', [])))\n    if isinstance(rules, dict) and ('SecurityGroupRuleId' in rules or 'securityGroupRuleId' in rules):\n        rules = [rules]\n    ids = sorted({r.get('SecurityGroupRuleId', r.get('securityGroupRuleId'))\n                  for r in items(rules)\n                  if isinstance(r.get('SecurityGroupRuleId', r.get('securityGroupRuleId')), str)})\n    if not group or not ids:\n        raise ValueError('Modification event lacks group or rule IDs; preserve for investigation')\n    return group, ids\n\n\ndef event_detail(event):\n    if not isinstance(event, dict):\n        return {}\n    detail = event.get('detail', event)\n    return detail if isinstance(detail, dict) else {}\n\n\ndef supported(detail):\n    return (detail.get('eventSource') == 'ec2.amazonaws.com'\n            and detail.get('eventName') in ('AuthorizeSecurityGroupIngress', 'ModifySecurityGroupRules')\n            and not detail.get('errorCode') and not detail.get('errorMessage'))\n\n\ndef detect(event, current_rules=None):\n    \"\"\"Accept a raw CloudTrail event or its EventBridge envelope.\"\"\"\n    detail = event_detail(event)\n    if not supported(detail):\n        return []\n    request = detail.get('requestParameters') or {}\n    if not isinstance(request, dict):\n        return []\n    modified = detail.get('eventName') == 'ModifySecurityGroupRules'\n    if modified:\n        group, ids = modification_request(detail)\n        if current_rules is None:\n            raise ValueError('Modification detection requires current rule lookup')\n        request = {'groupId': group}\n        permissions = []\n        for rule in current_rules:\n            if (rule.get('SecurityGroupRuleId') not in ids or rule.get('GroupId') != group\n                    or rule.get('IsEgress') is not False):\n                continue\n            permissions.append({\n                'ipProtocol': rule.get('IpProtocol'), 'fromPort': rule.get('FromPort'),\n                'toPort': rule.get('ToPort'), 'securityGroupRuleId': rule.get('SecurityGroupRuleId'),\n                'ipRanges': [{'cidrIp': rule.get('CidrIpv4')}],\n                'ipv6Ranges': [{'cidrIpv6': rule.get('CidrIpv6')}]})\n    else:\n        permissions = items(request.get('ipPermissions'))\n        # Legacy single-permission EC2 request form.\n        if not permissions and 'ipProtocol' in request:\n            permissions = [dict(request, ipRanges={'items': [{'cidrIp': request.get('cidrIp')}]})]\n    findings = []\n    for permission in permissions:\n        if not allows_ssh(permission):\n            continue\n        cidrs = [p.get('cidrIp') for p in items(permission.get('ipRanges'))]\n        cidrs += [p.get('cidrIpv6') for p in items(permission.get('ipv6Ranges'))]\n        for cidr in sorted({c for c in cidrs if isinstance(c, str) and world_cidr(c)}):\n            identity = detail.get('userIdentity') or {}\n            findings.append({\n                'ruleId': 'AG-SSH-002' if modified else 'AG-SSH-001',\n                'title': 'Security group ingress permits SSH from the entire internet',\n                'eventId': detail.get('eventID'),\n                'eventName': detail.get('eventName'),\n                'evidenceBasis': 'current-rule-state' if modified else 'event-request',\n                'securityGroupRuleId': permission.get('securityGroupRuleId'),\n                'eventTime': detail.get('eventTime'),\n                'region': detail.get('awsRegion'),\n                'groupId': request.get('groupId'),\n                'groupName': request.get('groupName'),\n                'actorArn': identity.get('arn') if isinstance(identity, dict) else None,\n                'cidr': cidr,\n                'protocol': permission.get('ipProtocol'),\n                'fromPort': permission.get('fromPort'),\n                'toPort': permission.get('toPort'),\n                'assessment': 'Risky rule change; actual host reachability is not established.'\n            })\n    return findings\n\n\ndef handler(event, context):\n    detail = event_detail(event)\n    current_rules = None\n    if supported(detail) and detail.get('eventName') == 'ModifySecurityGroupRules':\n        import boto3\n        group, ids = modification_request(detail)\n        current_rules = []\n        paginator = boto3.client('ec2').get_paginator('describe_security_group_rules')\n        for page in paginator.paginate(Filters=[{'Name': 'security-group-rule-id', 'Values': ids}]):\n            current_rules.extend(page.get('SecurityGroupRules', []))\n        unresolved = len(set(ids) - {r['SecurityGroupRuleId'] for r in current_rules})\n        print(json.dumps({'lookupRuleCount': len(current_rules), 'unresolvedRuleCount': unresolved}))\n    findings = detect(event, current_rules=current_rules)\n    if findings:\n        # Only explicitly enabled lab invocations can inject this synthetic failure.\n        if (os.environ.get('ENABLE_FAILURE_SIMULATION') == 'true'\n                and event.get('auditguardFailureSimulation') is True):\n            raise RuntimeError('AuditGuard lab: simulated failure before SNS publish')\n        import boto3\n        # Publish errors propagate to asynchronous retries and the failure destination.\n        boto3.client('sns').publish(\n            TopicArn=os.environ['ALERT_TOPIC_ARN'],\n            Subject='AuditGuard: world-open SSH rule detected',\n            Message=json.dumps({'findings': findings}, indent=2))\n    print(json.dumps({'eventName': detail.get('eventName'), 'findingCount': len(findings)}))\n    return {'findingCount': len(findings)}\n"
+        }
+      },
+      "DependsOn": "DetectorLogs"
+    },
+    "IngressRule": {
+      "Type": "AWS::Events::Rule",
+      "Properties": {
+        "Description": "Evaluate successful ingress authorization calls for world-open SSH.",
+        "State": "ENABLED",
+        "EventPattern": {
+          "source": [
+            "aws.ec2"
+          ],
+          "detail-type": [
+            "AWS API Call via CloudTrail"
+          ],
+          "detail": {
+            "eventSource": [
+              "ec2.amazonaws.com"
+            ],
+            "eventName": [
+              "AuthorizeSecurityGroupIngress",
+              "ModifySecurityGroupRules"
+            ],
+            "errorCode": [
+              {
+                "exists": false
+              }
+            ]
+          }
+        },
+        "Targets": [
+          {
+            "Id": "RiskySshDetector",
+            "Arn": {
+              "Fn::GetAtt": [
+                "Detector",
+                "Arn"
+              ]
+            },
+            "RetryPolicy": {
+              "MaximumRetryAttempts": 2,
+              "MaximumEventAgeInSeconds": 3600
+            },
+            "DeadLetterConfig": {
+              "Arn": {
+                "Fn::GetAtt": [
+                  "DeliveryFailures",
+                  "Arn"
+                ]
+              }
+            }
+          }
+        ],
+        "Name": {
+          "Fn::Sub": "${AWS::StackName}-ingress"
+        }
+      },
+      "DependsOn": [
+        "DeliveryQueuePolicy",
+        "AsyncFailureDestination"
+      ]
+    },
+    "InvokePermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Ref": "Detector"
+        },
+        "Principal": "events.amazonaws.com",
+        "SourceArn": {
+          "Fn::GetAtt": [
+            "IngressRule",
+            "Arn"
+          ]
+        },
+        "SourceAccount": {
+          "Ref": "AWS::AccountId"
+        }
+      }
+    },
+    "DeliveryFailures": {
+      "Type": "AWS::SQS::Queue",
+      "Properties": {
+        "QueueName": {
+          "Fn::Sub": "${AWS::StackName}-delivery-failures"
+        },
+        "SqsManagedSseEnabled": true,
+        "MessageRetentionPeriod": 1209600,
+        "VisibilityTimeout": 120
+      }
+    },
+    "ProcessingFailures": {
+      "Type": "AWS::SQS::Queue",
+      "Properties": {
+        "QueueName": {
+          "Fn::Sub": "${AWS::StackName}-processing-failures"
+        },
+        "SqsManagedSseEnabled": true,
+        "MessageRetentionPeriod": 1209600,
+        "VisibilityTimeout": 120
+      }
+    },
+    "DeliveryQueuePolicy": {
+      "Type": "AWS::SQS::QueuePolicy",
+      "Properties": {
+        "Queues": [
+          {
+            "Ref": "DeliveryFailures"
+          }
+        ],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "events.amazonaws.com"
+              },
+              "Action": "sqs:SendMessage",
+              "Resource": {
+                "Fn::GetAtt": [
+                  "DeliveryFailures",
+                  "Arn"
+                ]
+              },
+              "Condition": {
+                "ArnEquals": {
+                  "aws:SourceArn": {
+                    "Fn::Sub": "arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${AWS::StackName}-ingress"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "AsyncFailureDestination": {
+      "Type": "AWS::Lambda::EventInvokeConfig",
+      "Properties": {
+        "FunctionName": {
+          "Ref": "Detector"
+        },
+        "Qualifier": "$LATEST",
+        "MaximumRetryAttempts": 2,
+        "MaximumEventAgeInSeconds": 3600,
+        "DestinationConfig": {
+          "OnFailure": {
+            "Destination": {
+              "Fn::GetAtt": [
+                "ProcessingFailures",
+                "Arn"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "LambdaErrors": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": {
+          "Fn::Sub": "${AWS::StackName}-errors"
+        },
+        "Namespace": "AWS/Lambda",
+        "MetricName": "Errors",
+        "Dimensions": [
+          {
+            "Name": "FunctionName",
+            "Value": {
+              "Ref": "Detector"
+            }
+          }
+        ],
+        "Statistic": "Sum",
+        "Period": 60,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "AlertTopicArn"
+          }
+        ]
+      }
+    },
+    "LambdaThrottles": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": {
+          "Fn::Sub": "${AWS::StackName}-throttles"
+        },
+        "Namespace": "AWS/Lambda",
+        "MetricName": "Throttles",
+        "Dimensions": [
+          {
+            "Name": "FunctionName",
+            "Value": {
+              "Ref": "Detector"
+            }
+          }
+        ],
+        "Statistic": "Sum",
+        "Period": 60,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "AlertTopicArn"
+          }
+        ]
+      }
+    },
+    "DestinationErrors": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": {
+          "Fn::Sub": "${AWS::StackName}-destinationdeliveryfailures"
+        },
+        "Namespace": "AWS/Lambda",
+        "MetricName": "DestinationDeliveryFailures",
+        "Dimensions": [
+          {
+            "Name": "FunctionName",
+            "Value": {
+              "Ref": "Detector"
+            }
+          }
+        ],
+        "Statistic": "Sum",
+        "Period": 60,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "AlertTopicArn"
+          }
+        ]
+      }
+    },
+    "DeliveryFailuresAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": {
+          "Fn::Sub": "${AWS::StackName}-deliveryfailures"
+        },
+        "Namespace": "AWS/SQS",
+        "MetricName": "ApproximateNumberOfMessagesVisible",
+        "Dimensions": [
+          {
+            "Name": "QueueName",
+            "Value": {
+              "Fn::GetAtt": [
+                "DeliveryFailures",
+                "QueueName"
+              ]
+            }
+          }
+        ],
+        "Statistic": "Maximum",
+        "Period": 60,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "AlertTopicArn"
+          }
+        ]
+      }
+    },
+    "ProcessingFailuresAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": {
+          "Fn::Sub": "${AWS::StackName}-processingfailures"
+        },
+        "Namespace": "AWS/SQS",
+        "MetricName": "ApproximateNumberOfMessagesVisible",
+        "Dimensions": [
+          {
+            "Name": "QueueName",
+            "Value": {
+              "Fn::GetAtt": [
+                "ProcessingFailures",
+                "QueueName"
+              ]
+            }
+          }
+        ],
+        "Statistic": "Maximum",
+        "Period": 60,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "AlertTopicArn"
+          }
+        ]
+      }
+    },
+    "EventBridgeDlqErrors": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": {
+          "Fn::Sub": "${AWS::StackName}-eventbridge-dlq-errors"
+        },
+        "Namespace": "AWS/Events",
+        "MetricName": "InvocationsFailedToBeSentToDLQ",
+        "Dimensions": [
+          {
+            "Name": "RuleName",
+            "Value": {
+              "Ref": "IngressRule"
+            }
+          }
+        ],
+        "Statistic": "Sum",
+        "Period": 60,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "AlertTopicArn"
+          }
+        ]
+      }
+    }
+  },
+  "Outputs": {
+    "FunctionName": {
+      "Value": {
+        "Ref": "Detector"
+      }
+    },
+    "RuleName": {
+      "Value": {
+        "Ref": "IngressRule"
+      }
+    },
+    "LogGroupName": {
+      "Value": {
+        "Ref": "DetectorLogs"
+      }
+    },
+    "ProcessingFailureQueueUrl": {
+      "Value": {
+        "Ref": "ProcessingFailures"
+      }
+    },
+    "DeliveryFailureQueueUrl": {
+      "Value": {
+        "Ref": "DeliveryFailures"
+      }
+    }
+  },
+  "Conditions": {
+    "CreateRuntimeRole": {
+      "Fn::Equals": [
+        {
+          "Ref": "RuntimeRoleArn"
+        },
+        ""
+      ]
+    }
+  }
+}

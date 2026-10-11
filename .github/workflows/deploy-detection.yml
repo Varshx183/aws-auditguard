@@ -1,0 +1,56 @@
+name: Deploy detection with OIDC
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Deploy or delete the detection stack (base stack managed separately)
+        type: choice
+        options: [deploy, delete]
+        default: deploy
+      enable_failure_demo:
+        description: Enable synthetic failure injection for the lab exercise
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: auditguard-detection-deployment
+  cancel-in-progress: false
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: us-east-1
+      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      CFN_ROLE_ARN: ${{ vars.CFN_ROLE_ARN }}
+      RUNTIME_ROLE_ARN: ${{ vars.RUNTIME_ROLE_ARN }}
+      OPERATION: ${{ inputs.operation }}
+      ENABLE_FAILURE_DEMO: ${{ inputs.enable_failure_demo }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # checkout v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # setup-python v6
+        with:
+          python-version: '3.12'
+      - name: Validate code and templates before obtaining AWS credentials
+        run: |
+          pip install -r requirements-dev.txt
+          cfn-lint infrastructure/*.yaml infrastructure/*.json
+          python -m unittest discover -s tests -v
+          for script in scripts/*.sh; do bash -n "$script" || exit; done
+      - name: Check bootstrap variables
+        run: |
+          test -n "$AWS_ROLE_ARN" && test -n "$CFN_ROLE_ARN" && test -n "$RUNTIME_ROLE_ARN"
+      - name: Obtain short-lived AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # configure-aws-credentials v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+          role-session-name: AuditGuard-${{ github.run_id }}
+          mask-aws-account-id: true
+      - name: Deploy or delete scoped detection stack
+        run: bash scripts/ci-detection.sh

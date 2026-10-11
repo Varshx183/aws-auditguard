@@ -1,0 +1,23 @@
+name: Validate infrastructure
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # checkout v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # setup-python v6
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements-dev.txt
+      - run: cfn-lint infrastructure/*.yaml infrastructure/*.json
+      - run: for script in scripts/*.sh; do bash -n "$script" || exit; done
+      - run: python -m json.tool examples/create-security-group.json > /dev/null
+      - run: python -m unittest discover -s tests -v
+      - run: python scripts/demo.py
+      - name: Check generated templates are reproducible
+        run: |
+          python scripts/build_detection_template.py
+          python scripts/build_oidc_template.py
+          git diff --exit-code -- infrastructure/risky-ssh.json infrastructure/github-oidc.json

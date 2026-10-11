@@ -1,0 +1,14 @@
+{
+  "eventVersion": "1.11",
+  "userIdentity": {"type": "AssumedRole", "accountId": "111122223333", "arn": "arn:aws:sts::111122223333:assumed-role/LabRole/example-session"},
+  "eventTime": "2026-10-10T17:00:00Z",
+  "eventSource": "ec2.amazonaws.com",
+  "eventName": "CreateSecurityGroup",
+  "awsRegion": "us-east-1",
+  "sourceIPAddress": "192.0.2.10",
+  "requestParameters": {"groupName": "auditguard-test-example", "vpcId": "vpc-0123456789abcdef0"},
+  "responseElements": {"groupId": "sg-0123456789abcdef0"},
+  "eventType": "AwsApiCall",
+  "managementEvent": true,
+  "readOnly": false
+}

@@ -1,0 +1,46 @@
+{
+  "version": "0",
+  "source": "aws.ec2",
+  "detail-type": "AWS API Call via CloudTrail",
+  "detail": {
+    "eventSource": "ec2.amazonaws.com",
+    "eventName": "AuthorizeSecurityGroupIngress",
+    "eventID": "synthetic-event",
+    "eventTime": "2026-10-11T12:00:00Z",
+    "awsRegion": "us-east-1",
+    "userIdentity": {
+      "arn": "synthetic-actor"
+    },
+    "requestParameters": {
+      "groupId": "sg-example",
+      "ipPermissions": {
+        "items": [
+          {
+            "ipProtocol": "tcp",
+            "fromPort": 22,
+            "toPort": 22,
+            "ipRanges": {
+              "items": [
+                {
+                  "cidrIp": "10.0.0.0/8"
+                }
+              ]
+            }
+          },
+          {
+            "ipProtocol": "tcp",
+            "fromPort": 443,
+            "toPort": 443,
+            "ipRanges": {
+              "items": [
+                {
+                  "cidrIp": "0.0.0.0/0"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  }
+}
